@@ -230,15 +230,30 @@ inject_toolchain() {
     
     cd "$platform_dir"
     
-    # 检查是否已有 staging_dir
-    if [[ -d "staging_dir" ]]; then
-        log_info "备份现有 staging_dir"
-        mv staging_dir staging_dir.fresh_build
+    # 从缓存恢复 toolchain/ build_dir/ staging_dir/（如果存在）
+    local restored=0
+    if [[ -d "$TOOLCHAIN_DIR/toolchain" ]]; then
+        cp -r "$TOOLCHAIN_DIR/toolchain" toolchain/
+        log_info "恢复: toolchain/"
+        restored=1
+    fi
+    if [[ -d "$TOOLCHAIN_DIR/build_dir" ]]; then
+        cp -r "$TOOLCHAIN_DIR/build_dir" build_dir/
+        log_info "恢复: build_dir/"
+        restored=1
+    fi
+    if [[ -d "$TOOLCHAIN_DIR/staging_dir" ]]; then
+        cp -r "$TOOLCHAIN_DIR/staging_dir" staging_dir/
+        log_info "恢复: staging_dir/"
+        restored=1
     fi
     
-    # 从缓存恢复
-    cp -r "$TOOLCHAIN_DIR" staging_dir
-    log_info "工具链已恢复: $(du -sh staging_dir | cut -f1)"
+    if [[ $restored -eq 1 ]]; then
+        log_info "工具链已恢复"
+    else
+        log_warn "工具链缓存目录为空，将从源码编译"
+        return 1
+    fi
 }
 
 # ========== 编译固件 ==========
@@ -317,29 +332,41 @@ build_platform() {
     log_header "编译平台: ${platform}"
     
     local platform_dir="${WORKDIR}/build-${platform}"
+    local source_dir="${WORKDIR}/openwrt"
     local output_firmware="${WORKDIR}/output/firmware"
     local output_packages="${WORKDIR}/output/packages"
     
     mkdir -p "$platform_dir" "$output_firmware" "$output_packages"
     
-    # 1. 获取源码
-    get_source "$platform_dir" || return 1
+    # 1. 准备源码目录
+    # 优先使用工作流已准备好的 openwrt/ 目录（含 feeds + acctl）
+    # 仅在 openwrt/ 不存在时才自行 clone
+    if [[ -d "$source_dir" && -f "$source_dir/Makefile" ]]; then
+        log_step "使用工作流已准备好的源码: ${source_dir}"
+        # 从已准备好的源码复制到平台构建目录
+        # 使用硬链接避免重复占用磁盘
+        log_info "复制源码到平台构建目录..."
+        cp -al "$source_dir" "$platform_dir" 2>/dev/null || cp -r "$source_dir" "$platform_dir"
+        log_info "源码准备完成"
+    else
+        log_step "openwrt/ 不存在，自行克隆源码"
+        get_source "$platform_dir" || return 1
+        # 自行克隆时需要手动添加 acctl 和 feeds
+        add_acctl
+        apply_feeds
+    fi
     
-    # 2. 尝试恢复工具链
-    if [[ -n "${TOOLCHAIN_DIR:-}" ]]; then
+    cd "$platform_dir"
+    
+    # 2. 尝试恢复工具链（仅当有缓存且目录中尚无工具链时）
+    if [[ -n "${TOOLCHAIN_DIR:-}" ]] && [[ ! -d "$platform_dir/staging_dir" ]]; then
         inject_toolchain "$platform_dir"
     fi
     
     # 3. 应用配置
     apply_config "$platform" || return 1
     
-    # 4. 添加 acctl
-    add_acctl
-    
-    # 5. 应用 feeds
-    apply_feeds
-    
-    # 6. 编译
+    # 4. 编译
     local failed=0
     
     if [[ "$ARTIFACT" == "firmware" || "$ARTIFACT" == "both" ]]; then
@@ -349,9 +376,6 @@ build_platform() {
     if [[ "$ARTIFACT" == "packages" || "$ARTIFACT" == "both" ]]; then
         build_packages "$platform_dir" || failed=1
     fi
-    
-    # 7. 清理（保留下次复用）
-    # 不清理源码，下次可用增量更新
     
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
