@@ -207,14 +207,25 @@ add_acctl() {
     log_step "添加 acctl 软件包..."
     
     if [[ -d "package/acctl" ]]; then
-        log_info "acctl 已存在，跳过"
-        return 0
+        log_info "acctl 已存在，跳过克隆"
+    else
+        if git clone --depth=1 -b "$ACCTL_BRANCH" "$ACCTL_REPO" package/acctl 2>&1 | tee -a "${WORKDIR}/logs/acctl_clone.log"; then
+            log_info "acctl 添加成功"
+        else
+            log_warn "acctl 克隆失败，继续编译（acctl 可能不在范围内）"
+            return 0
+        fi
     fi
     
-    if git clone --depth=1 -b "$ACCTL_BRANCH" "$ACCTL_REPO" package/acctl 2>&1 | tee -a "${WORKDIR}/logs/acctl_clone.log"; then
-        log_info "acctl 添加成功"
-    else
-        log_warn "acctl 克隆失败，继续编译（acctl 可能不在范围内）"
+    # 修正 PKG_BUILD_DIR 硬编码问题（无论新增还是已存在都需要修正）
+    if [[ -f "package/acctl/Makefile" ]]; then
+        # 将硬编码的平台路径替换为 OpenWrt 变量 $(BUILD_DIR)
+        if grep -q 'TOPDIR.*/build_dir/target-.*\${PKG_NAME}\|TOPDIR.*/build_dir/target-.*/$(PKG_NAME)' package/acctl/Makefile 2>/dev/null; then
+            sed -i 's|PKG_BUILD_DIR:=$(if \$(KERNEL_BUILD_DIR),\$(KERNEL_BUILD_DIR),\$(TOPDIR)/build_dir/target-[^/]*)/$(PKG_NAME)|PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)|' package/acctl/Makefile 2>/dev/null || true
+            # 兜底：替换任何硬编码的 target-* 路径
+            sed -i 's|\$(TOPDIR)/build_dir/target-[^/]*/$(PKG_NAME)|$(BUILD_DIR)/$(PKG_NAME)|g' package/acctl/Makefile 2>/dev/null || true
+            log_info "acctl Makefile 已修正 PKG_BUILD_DIR"
+        fi
     fi
 }
 
@@ -263,6 +274,20 @@ build_firmware() {
     
     cd "$platform_dir"
     
+    # 先编译 toolchain（如果尚未编译）
+    if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
+        log_step "编译 toolchain (线程: ${BUILD_THREADS})"
+        local tc_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
+        
+        if ! make toolchain -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
+            log_error "Toolchain 编译失败"
+            return 1
+        fi
+        
+        touch "staging_dir/.toolchain_ready"
+        log_info "Toolchain 编译完成"
+    fi
+    
     log_step "开始编译固件 (线程: ${BUILD_THREADS})"
     
     local log_file="${WORKDIR}/logs/build-${PLATFORM}-firmware.log"
@@ -276,7 +301,7 @@ build_firmware() {
                 local fname="$(basename "$f")"
                 cp -v "$f" "${output_firmware}/${fname}"
                 log_info "  → ${fname} ($(du -h "$f" | cut -f1))"
-            fi
+            end
         done
         
         return 0
@@ -293,11 +318,28 @@ build_packages() {
     
     cd "$platform_dir"
     
+    # 1. 先编译 toolchain（如果尚未编译）
+    if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
+        log_step "编译 toolchain (线程: ${BUILD_THREADS})"
+        local tc_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
+        
+        if ! make toolchain -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
+            log_error "Toolchain 编译失败"
+            return 1
+        fi
+        
+        # 标记 toolchain 已就绪
+        touch "staging_dir/.toolchain_ready"
+        log_info "Toolchain 编译完成"
+    else
+        log_info "Toolchain 已就绪，跳过编译"
+    fi
+    
+    # 2. 编译 acctl 包
     log_step "编译软件包 (线程: ${BUILD_THREADS})"
     
     local log_file="${WORKDIR}/logs/build-${PLATFORM}-packages.log"
     
-    # 编译 acctl 包
     if [[ -d "package/acctl" ]]; then
         if make package/acctl/compile V=s -j"${BUILD_THREADS}" 2>&1 | tee "$log_file"; then
             log_info "acctl 编译成功"
