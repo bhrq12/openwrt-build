@@ -59,7 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_REPO_DIR="${WORKSPACE:-${SCRIPT_DIR}/..}"
 
 log_header "OpenWrt Build Script"
-log_info "版本: 2.0 (支持工具链缓存)"
+log_info "版本: 3.0 (Hash 精准工具链缓存)"
 log_info "工作目录: ${WORKDIR}"
 log_info "编译线程: ${BUILD_THREADS}"
 
@@ -108,32 +108,45 @@ restore_toolchain() {
     return 0
 }
 
-# ========== 源码获取 ==========
+# ========== 源码获取（带重试） ==========
 get_source() {
     local platform_dir="$1"
-    
+    local retry=3
+    local interval=10
+
     cd "$platform_dir"
-    
+
     if [[ ! -d ".git" ]]; then
         log_step "克隆源码: ${OPENWRT_REPO} (${OPENWRT_VERSION})"
-        git clone --depth=1 -b "$OPENWRT_VERSION" "$OPENWRT_REPO" . || {
-            log_error "源码克隆失败"
-            return 1
-        }
-        log_info "源码克隆完成"
+
+        for i in $(seq 1 $retry); do
+            echo "克隆尝试 ($i/$retry)..."
+            if git clone --depth=1 -b "$OPENWRT_VERSION" "$OPENWRT_REPO" . 2>&1; then
+                log_info "源码克隆完成"
+                break
+            else
+                echo "克隆失败，等待 ${interval}s 后重试..."
+                rm -rf "$platform_dir"/*
+                [[ $i -lt $retry ]] && sleep $interval || {
+                    log_error "源码克隆失败 (共尝试 $retry 次)"
+                    return 1
+                }
+            fi
+        done
     else
         log_step "更新源码..."
-        git pull --ff-only origin "$OPENWRT_VERSION" || {
+        git pull --ff-only origin "$OPENWRT_VERSION" 2>&1 || {
             log_warn "源码更新失败，使用现有版本继续"
         }
     fi
-    
+
     # 记录源码版本信息
     {
         echo "OPENWRT_REPO=$OPENWRT_REPO"
         echo "OPENWRT_VERSION=$OPENWRT_VERSION"
         echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || echo 'N/A')"
         echo "DATE=$(date -Iseconds)"
+        echo "TOOLCHAIN_DIR=${TOOLCHAIN_DIR:-none}"
     } > "${WORKDIR}/logs/source_info.txt"
 }
 
