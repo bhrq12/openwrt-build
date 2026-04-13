@@ -416,8 +416,8 @@ main() {
         exit 1
     fi
     
-    # 尝试恢复工具链
-    restore_toolchain
+    # 尝试恢复工具链（无缓存时返回1，set -e下需用 || true 兜底）
+    restore_toolchain || true
     
     # 编译各平台
     local failed_platforms=""
