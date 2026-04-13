@@ -331,37 +331,30 @@ build_platform() {
     
     log_header "编译平台: ${platform}"
     
-    local platform_dir="${WORKDIR}/build-${platform}"
     local source_dir="${WORKDIR}/openwrt"
     local output_firmware="${WORKDIR}/output/firmware"
     local output_packages="${WORKDIR}/output/packages"
     
-    mkdir -p "$platform_dir" "$output_firmware" "$output_packages"
+    mkdir -p "$output_firmware" "$output_packages"
     
     # 1. 准备源码目录
     # 优先使用工作流已准备好的 openwrt/ 目录（含 feeds + acctl）
     # 仅在 openwrt/ 不存在时才自行 clone
     if [[ -d "$source_dir" && -f "$source_dir/Makefile" ]]; then
         log_step "使用工作流已准备好的源码: ${source_dir}"
-        # 从已准备好的源码复制到平台构建目录
-        # 注意: $platform_dir 已由 mkdir -p 创建，必须用 source/. → target/
-        #       否则 cp 会把 source 作为子目录嵌套进去
-        log_info "复制源码到平台构建目录..."
-        cp -al "$source_dir"/. "$platform_dir"/ 2>/dev/null || cp -r "$source_dir"/. "$platform_dir"/
-        log_info "源码准备完成"
     else
         log_step "openwrt/ 不存在，自行克隆源码"
-        get_source "$platform_dir" || return 1
-        # 自行克隆时需要手动添加 acctl 和 feeds
+        get_source "$source_dir" || return 1
+        cd "$source_dir"
         add_acctl
         apply_feeds
     fi
     
-    cd "$platform_dir"
+    cd "$source_dir"
     
     # 2. 尝试恢复工具链（仅当有缓存且目录中尚无工具链时）
-    if [[ -n "${TOOLCHAIN_DIR:-}" ]] && [[ ! -d "$platform_dir/staging_dir" ]]; then
-        inject_toolchain "$platform_dir"
+    if [[ -n "${TOOLCHAIN_DIR:-}" ]] && [[ ! -d "$source_dir/staging_dir" ]]; then
+        inject_toolchain "$source_dir"
     fi
     
     # 3. 应用配置
@@ -371,11 +364,11 @@ build_platform() {
     local failed=0
     
     if [[ "$ARTIFACT" == "firmware" || "$ARTIFACT" == "both" ]]; then
-        build_firmware "$platform_dir" || failed=1
+        build_firmware "$source_dir" || failed=1
     fi
     
     if [[ "$ARTIFACT" == "packages" || "$ARTIFACT" == "both" ]]; then
-        build_packages "$platform_dir" || failed=1
+        build_packages "$source_dir" || failed=1
     fi
     
     local end_time=$(date +%s)
