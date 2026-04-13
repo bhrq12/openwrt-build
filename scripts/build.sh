@@ -301,7 +301,7 @@ build_firmware() {
                 local fname="$(basename "$f")"
                 cp -v "$f" "${output_firmware}/${fname}"
                 log_info "  → ${fname} ($(du -h "$f" | cut -f1))"
-            end
+            fi
         done
         
         return 0
