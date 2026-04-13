@@ -1,0 +1,298 @@
+name: OpenWrt Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ========== 平台选择 ==========
+      platforms:
+        description: 'Target platforms (multi-select, hold Ctrl/Cmd)'
+        required: true
+        type: string
+        default: 'ipq40xx'
+      # 示例: "ipq40xx x86_64"
+      # 不提供 choices 以支持多选自由输入
+
+      # ========== 源码版本 ==========
+      openwrt_version:
+        description: 'OpenWrt source (branch:master, tag:v23.05.3, or commit hash)'
+        required: true
+        type: string
+        default: 'master'
+
+      # ========== 产物类型 ==========
+      artifact_type:
+        description: 'Build artifact type'
+        required: true
+        type: choice
+        options:
+          - firmware
+          - packages
+          - both
+        default: 'firmware'
+
+      # ========== 工具链策略 ==========
+      toolchain_strategy:
+        description: 'Toolchain build strategy'
+        required: true
+        type: choice
+        options:
+          - use_cache
+          - force_rebuild
+          - skip_toolchain
+        default: 'use_cache'
+
+      # ========== 高级选项 ==========
+      advanced_options:
+        description: 'Enable advanced options'
+        required: false
+        type: boolean
+        default: false
+
+      custom_openwrt_repo:
+        description: 'Custom OpenWrt repo URL (leave empty for default)'
+        required: false
+        type: string
+        default: ''
+        displayName: 'Custom OpenWrt Repo URL'
+
+      custom_acctl_repo:
+        description: 'Custom acctl repo URL (leave empty for default)'
+        required: false
+        type: string
+        default: ''
+        displayName: 'Custom acctl Repo URL'
+
+      custom_acctl_branch:
+        description: 'Custom acctl branch/tag'
+        required: false
+        type: string
+        default: 'main'
+        displayName: 'Custom acctl Branch'
+
+      custom_config_url:
+        description: 'Custom .config raw URL (optional)'
+        required: false
+        type: string
+        default: ''
+        displayName: 'Custom Config URL'
+
+      build_threads:
+        description: 'Build threads (0 = auto)'
+        required: false
+        type: string
+        default: '0'
+
+concurrency:
+  group: dispatch-${{ inputs.platforms }}-${{ inputs.openwrt_version }}
+  cancel-in-progress: false
+
+jobs:
+  # ========== 预检查 ==========
+  precheck:
+    runs-on: ubuntu-latest
+    outputs:
+      platform_list: ${{ steps.parse_platforms.outputs.list }}
+      validated: ${{ steps.validate.outputs.valid }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse platform list
+        id: parse_platforms
+        run: |
+          echo "Raw input: '${{ inputs.platforms }}'"
+          
+          # 解析空格分隔的平台列表
+          PLATFORMS="${{ inputs.platforms }}"
+          VALID_PLATFORMS="ipq40xx x86_64 bcm2711 ramips-mt7621 all"
+          
+          # 转换为数组
+          read -ra PLATFORM_ARRAY <<< "$PLATFORMS"
+          
+          VALIDATED=""
+          for p in "${PLATFORM_ARRAY[@]}"; do
+            # 跳过空元素
+            [[ -z "$p" ]] && continue
+            # 验证平台有效性
+            if echo "$VALID_PLATFORMS" | grep -q "\b$p\b"; then
+              VALIDATED="$VALIDATED $p"
+            else
+              echo "Warning: Invalid platform '$p', skipping"
+            fi
+          done
+          
+          # 去除首空格
+          VALIDATED=$(echo "$VALIDATED" | sed 's/^ //')
+          
+          if [[ -z "$VALIDATED" ]]; then
+            echo "Error: No valid platforms specified"
+            exit 1
+          fi
+          
+          echo "Validated platforms: $VALIDATED"
+          echo "list=$VALIDATED" >> $GITHUB_OUTPUT
+
+      - name: Validate version
+        id: validate
+        run: |
+          VERSION="${{ inputs.openwrt_version }}"
+          
+          if [[ "$VERSION" == "master" || "$VERSION" == "main" ]]; then
+            echo "Branch: $VERSION"
+            echo "valid=true" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Tag: $VERSION"
+            echo "valid=true" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "Commit: $VERSION"
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "Warning: Version format unclear: $VERSION"
+            echo "valid=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check rate limit
+        run: |
+          echo "GitHub API Rate Limit Status:"
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/rate_limit | jq '.rate'
+
+      - name: Summary precheck
+        run: |
+          echo "## Dispatch Precheck" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Platforms | \`${{ steps.parse_platforms.outputs.list }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenWrt Version | \`${{ inputs.openwrt_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact Type | \`${{ inputs.artifact_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Toolchain Strategy | \`${{ inputs.toolchain_strategy }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ========== 工具链预处理 ==========
+  toolchain-prep:
+    needs: precheck
+    runs-on: ubuntu-latest
+    outputs:
+      toolchain_results: ${{ steps.prepare.outputs.results }}
+    steps:
+      - name: Determine toolchain needs
+        id: prepare
+        run: |
+          PLATFORMS="${{ needs.precheck.outputs.platform_list }}"
+          STRATEGY="${{ inputs.toolchain_strategy }}"
+          
+          echo "Platforms: $PLATFORMS"
+          echo "Strategy: $STRATEGY"
+          
+          if [[ "$STRATEGY" == "skip_toolchain" ]]; then
+            echo "Toolchain: Building from scratch (no cache)"
+            echo "results=skip" >> $GITHUB_OUTPUT
+          elif [[ "$STRATEGY" == "force_rebuild" ]]; then
+            echo "Toolchain: Force rebuild"
+            echo "results=rebuild" >> $GITHUB_OUTPUT
+          else
+            echo "Toolchain: Check and download if exists"
+            echo "results=use_cache" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check toolchain availability
+        if: needs.precheck.outputs.valid == 'true' && inputs.toolchain_strategy == 'use_cache'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PLATFORMS="${{ needs.precheck.outputs.platform_list }}"
+          VERSION="${{ inputs.openwrt_version }}"
+          
+          # 获取 commit hash
+          REPO="${{ inputs.custom_openwrt_repo || 'https://github.com/coolsnowwolf/lede' }}"
+          
+          if [[ "$VERSION" == "master" || "$VERSION" == "main" ]]; then
+            COMMIT=$(git ls-remote "$REPO" refs/heads/$VERSION 2>/dev/null | head -c 7 || echo "unknown")
+          else
+            COMMIT="${VERSION:0:7}"
+          fi
+          
+          echo "Checking toolchain cache for commit: $COMMIT"
+          
+          for PLATFORM in $PLATFORMS; do
+            [[ -z "$PLATFORM" ]] && continue
+            CACHE_KEY="toolchain-${PLATFORM}-${COMMIT}"
+            
+            echo ""
+            echo "Checking $CACHE_KEY..."
+            
+            if gh release view "$CACHE_KEY" &>/dev/null; then
+              echo "✓ Found: $CACHE_KEY"
+            else
+              echo "✗ Not found: $CACHE_KEY"
+              echo "Note: Will build toolchain from scratch if needed"
+            fi
+          done
+
+  # ========== 触发各平台编译 ==========
+  build-platforms:
+    needs: [precheck, toolchain-prep]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.precheck.outputs.platform_list) }}
+    steps:
+      - name: Trigger build for ${{ matrix.platform }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowId = 'build.yml';
+            const ref = '${{ github.ref }}';
+            
+            const inputs = {
+              platform: '${{ matrix.platform }}',
+              artifact: '${{ inputs.artifact_type }}',
+              openwrt_version: '${{ inputs.openwrt_version }}',
+              use_cached_toolchain: ${{ inputs.toolchain_strategy == 'use_cache' }},
+              custom_config_url: '${{ inputs.custom_config_url }}'
+            };
+            
+            console.log('Triggering workflow with inputs:', JSON.stringify(inputs, null, 2));
+            
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowId,
+              ref: ref,
+              inputs: inputs
+            });
+            
+            console.log('Workflow triggered successfully:', response.status);
+
+  # ========== 汇总 ==========
+  summary:
+    needs: [precheck, build-platforms]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## OpenWrt Dispatch Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Jobs Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          PLATFORMS="${{ needs.precheck.outputs.platform_list }}"
+          for p in $PLATFORMS; do
+            [[ -z "$p" ]] && continue
+            echo "| \`$p\` | Triggered |" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Go to **Actions** tab to monitor individual platform builds" >> $GITHUB_STEP_SUMMARY
+          echo "2. Each platform runs in parallel as a separate job" >> $GITHUB_STEP_SUMMARY
+          echo "3. Artifacts are retained for 14 days after completion" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- OpenWrt Version: \`${{ inputs.openwrt_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Artifact Type: \`${{ inputs.artifact_type }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Toolchain Strategy: \`${{ inputs.toolchain_strategy }}\`" >> $GITHUB_STEP_SUMMARY

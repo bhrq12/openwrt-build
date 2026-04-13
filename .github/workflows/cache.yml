@@ -1,0 +1,149 @@
+name: Toolchain Cache Manager
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'Target platform'
+        required: true
+        type: string
+      version:
+        description: 'OpenWrt version (branch/tag/commit)'
+        required: true
+        type: string
+        default: 'master'
+      strategy:
+        description: 'Cache strategy (use_cache | force_rebuild | skip)'
+        required: false
+        type: string
+        default: 'use_cache'
+    outputs:
+      cache_key:
+        description: 'Generated cache key'
+        value: ${{ jobs.manage.outputs.cache_key }}
+      cache_found:
+        description: 'Whether cache was found'
+        value: ${{ jobs.manage.outputs.cache_found }}
+      cache_url:
+        description: 'Direct download URL for the cache'
+        value: ${{ jobs.manage.outputs.cache_url }}
+      toolchain_dir:
+        description: 'Path to extracted toolchain directory'
+        value: ${{ jobs.manage.outputs.toolchain_dir }}
+
+env:
+  OPENWRT_REPO: https://github.com/coolsnowwolf/lede
+
+jobs:
+  manage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    outputs:
+      cache_key: ${{ steps.key.outputs.key }}
+      cache_found: ${{ steps.check.outputs.found }}
+      cache_url: ${{ steps.url.outputs.url }}
+      toolchain_dir: ${{ steps.extract.outputs.dir }}
+    
+    steps:
+      - name: Generate cache key
+        id: key
+        run: |
+          VERSION="${{ inputs.version }}"
+          PLATFORM="${{ inputs.platform }}"
+          
+          if [[ "$VERSION" == "master" || "$VERSION" == "main" ]]; then
+            COMMIT=$(git ls-remote "$OPENWRT_REPO" refs/heads/$VERSION 2>/dev/null | cut -f1 | head -c 7 || echo "unknown")
+          else
+            COMMIT="${VERSION:0:7}"
+          fi
+          
+          KEY="toolchain-${PLATFORM}-${COMMIT}"
+          echo "key=$KEY" >> $GITHUB_OUTPUT
+          echo "Cache key: $KEY"
+
+      - name: Check cache availability
+        id: check
+        if: inputs.strategy == 'use_cache'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY="${{ steps.key.outputs.key }}"
+          
+          if gh release view "$KEY" &>/dev/null; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "✓ Cache found: $KEY"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "✗ Cache not found: $KEY"
+          fi
+
+      - name: Download cache
+        id: download
+        if: steps.check.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY="${{ steps.key.outputs.key }}"
+          
+          gh release download "$KEY" \
+            --pattern "*.tar.zst" \
+            --dir "${{ github.workspace }}/toolchain_cache" \
+            --clobber
+          
+          ARCHIVE=$(ls "${{ github.workspace }}/toolchain_cache/"*.tar.zst 2>/dev/null | head -1)
+          
+          if [[ -n "$ARCHIVE" ]]; then
+            echo "Downloaded: $ARCHIVE"
+            echo "size=$(du -h "$ARCHIVE" | cut -f1)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract cache
+        id: extract
+        if: steps.check.outputs.found == 'true'
+        run: |
+          ARCHIVE=$(ls "${{ github.workspace }}/toolchain_cache/"*.tar.zst 2>/dev/null | head -1)
+          
+          if [[ -n "$ARCHIVE" ]]; then
+            echo "Extracting: $ARCHIVE"
+            tar -I 'zstd -d' -xf "$ARCHIVE" -C "${{ github.workspace }}/toolchain_cache/"
+            
+            if [[ -d "${{ github.workspace }}/toolchain_cache/staging_dir" ]]; then
+              echo "dir=${{ github.workspace }}/toolchain_cache/staging_dir" >> $GITHUB_OUTPUT
+              echo "✓ Toolchain extracted successfully"
+            else
+              echo "Warning: staging_dir not found after extraction"
+              echo "dir=" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Generate download URL
+        id: url
+        if: steps.check.outputs.found == 'true'
+        run: |
+          KEY="${{ steps.key.outputs.key }}"
+          # 生成带 token 的下载链接（7天有效期）
+          echo "url=https://github.com/${{ github.repository }}/releases/download/$KEY/" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          echo "## Toolchain Cache Manager" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | \`${{ inputs.platform }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Strategy | \`${{ inputs.strategy }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache Key | \`${{ steps.key.outputs.key }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cache Found | \`${{ steps.check.outputs.found || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.check.outputs.found }}" == "true" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Cache Ready**: Toolchain will be restored before build." >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ inputs.strategy }}" == "force_rebuild" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Forced Rebuild**: Building toolchain from source." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**No Cache**: Building toolchain from source." >> $GITHUB_STEP_SUMMARY
+          fi

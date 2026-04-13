@@ -18,55 +18,319 @@ on:
         required: true
         type: choice
         options:
-          - firmware     # 完整固件
-          - packages     # 仅 ipk 软件包
-          - both         # 两者都编译
+          - firmware
+          - packages
+          - both
+      openwrt_version:
+        description: 'OpenWrt source version'
+        required: false
+        default: 'master'
+        type: string
+      use_cached_toolchain:
+        description: 'Use cached toolchain from Releases'
+        required: false
+        default: true
+        type: boolean
+      custom_config_url:
+        description: 'Custom config URL (optional .config raw URL)'
+        required: false
+        default: ''
+        type: string
+
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      artifact:
+        required: true
+        type: string
+        default: 'firmware'
+      openwrt_version:
+        required: false
+        type: string
+        default: 'master'
+      use_cached_toolchain:
+        required: false
+        type: boolean
+        default: true
+      custom_config_url:
+        required: false
+        type: string
+        default: ''
+    outputs:
+      firmware_artifact:
+        description: 'Firmware artifact name'
+        value: ${{ jobs.build.outputs.firmware_artifact }}
+      packages_artifact:
+        description: 'Packages artifact name'
+        value: ${{ jobs.build.outputs.packages_artifact }}
 
 concurrency:
-  group: build-${{ inputs.platform }}
+  group: build-${{ inputs.platform }}-${{ inputs.openwrt_version }}
   cancel-in-progress: true
+
+env:
+  OPENWRT_REPO: https://github.com/coolsnowwolf/lede
+  ACCTL_REPO: https://github.com/bhrq12/acctl
+  ACCTL_BRANCH: main
+  BUILD_THREADS: 4
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
-
+    
+    outputs:
+      firmware_artifact: ${{ steps.artifact_names.outputs.firmware }}
+      packages_artifact: ${{ steps.artifact_names.outputs.packages }}
+    
     steps:
       - name: Checkout config repo
         uses: actions/checkout@v4
 
-      - name: Select platform config
+      - name: Setup build environment
         run: |
-          if [ "${{ inputs.platform }}" = "all" ]; then
-            echo "PLATFORMS=ipq40xx x86_64 bcm2711 ramips-mt7621" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig unzip zstd \
+            zlib1g-dev file make pkg-config wget curl jq
+
+      - name: Determine platforms to build
+        id: platforms
+        run: |
+          if [[ "${{ inputs.platform }}" == "all" ]]; then
+            PLATFORMS="ipq40xx x86_64 bcm2711 ramips-mt7621"
           else
-            echo "PLATFORMS=${{ inputs.platform }}" >> $GITHUB_ENV
+            PLATFORMS="${{ inputs.platform }}"
+          fi
+          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
+          echo "Platforms to build: $PLATFORMS"
+
+      - name: Generate artifact names
+        id: artifact_names
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          VERSION="${{ inputs.openwrt_version }}"
+          VERSION_SHORT="${VERSION:0:7}"
+          
+          if [[ "${{ inputs.platform }}" == "all" ]]; then
+            FIRMWARE="openwrt-firmware-all-${VERSION_SHORT}-${TIMESTAMP}"
+            PACKAGES="openwrt-packages-all-${VERSION_SHORT}-${TIMESTAMP}"
+          else
+            FIRMWARE="openwrt-firmware-${{ inputs.platform }}-${VERSION_SHORT}-${TIMESTAMP}"
+            PACKAGES="openwrt-packages-${{ inputs.platform }}-${VERSION_SHORT}-${TIMESTAMP}"
+          fi
+          
+          echo "firmware=$FIRMWARE" >> $GITHUB_OUTPUT
+          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+
+      - name: Generate toolchain cache key
+        id: toolchain_key
+        run: |
+          VERSION="${{ inputs.openwrt_version }}"
+          PLATFORM="${{ inputs.platform }}"
+          
+          # 获取源码 commit hash
+          if [[ "$VERSION" == "master" || "$VERSION" == "main" ]]; then
+            COMMIT_HASH=$(git ls-remote "$OPENWRT_REPO" refs/heads/$VERSION 2>/dev/null | head -c 7 || echo "unknown")
+          else
+            COMMIT_HASH="${VERSION:0:7}"
+          fi
+          
+          CACHE_KEY="toolchain-${PLATFORM}-${COMMIT_HASH}"
+          echo "key=$CACHE_KEY" >> $GITHUB_OUTPUT
+          echo "Toolchain cache key: $CACHE_KEY"
+
+      - name: Try download cached toolchain
+        if: inputs.use_cached_toolchain == true
+        id: download_toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CACHE_KEY="${{ steps.toolchain_key.outputs.key }}"
+          echo "Checking for toolchain cache: $CACHE_KEY"
+          
+          # 尝试从 Release 下载
+          if gh release view "$CACHE_KEY" --json assets --jq '.assets[0].url' &>/dev/null; then
+            echo "Found cached toolchain, downloading..."
+            
+            ARCHIVE_NAME="${CACHE_KEY}.tar.zst"
+            gh release download "$CACHE_KEY" --pattern "*.tar.zst" --dir . || {
+              echo "Download failed, will build toolchain"
+              echo "found=false" >> $GITHUB_OUTPUT
+              exit 0
+            }
+            
+            echo "Extracting toolchain..."
+            tar -I 'zstd -d' -xf "$ARCHIVE_NAME"
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Toolchain cache restored successfully"
+          else
+            echo "No cached toolchain found"
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build platforms
-        run: ./scripts/build.sh
-        env:
-          PLATFORMS: ${{ env.PLATFORMS }}
-          ARTIFACT: ${{ inputs.artifact }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_SHA: ${{ github.sha }}
+      - name: Clone OpenWrt source
+        run: |
+          if [[ "${{ steps.download_toolchain.outputs.found }}" != "true" ]]; then
+            echo "Cloning OpenWrt source (branch: ${{ inputs.openwrt_version }})..."
+            git clone --depth=1 -b "${{ inputs.openwrt_version }}" "$OPENWRT_REPO" openwrt
+          else
+            echo "Using cached toolchain, shallow clone for configs only..."
+            git clone --depth=1 -b "${{ inputs.openwrt_version }}" "$OPENWRT_REPO" openwrt
+            # 恢复工具链
+            if [[ -d "staging_dir" ]]; then
+              cp -r staging_dir openwrt/
+            fi
+          fi
 
-      - name: Upload firmware artifacts
+      - name: Add acctl package
+        run: |
+          cd openwrt
+          if [[ ! -d "package/acctl" ]]; then
+            git clone --depth=1 -b "$ACCTL_BRANCH" "$ACCTL_REPO" package/acctl
+            echo "acctl package added"
+          fi
+
+      - name: Apply custom feeds
+        run: |
+          cd openwrt
+          
+          FEEDS_CONF="${GITHUB_WORKSPACE}/configs/feeds.conf"
+          if [[ -f "$FEEDS_CONF" ]]; then
+            echo "Appending custom feeds configuration..."
+            cat "$FEEDS_CONF" >> feeds.conf.default
+          fi
+          
+          ./scripts/feeds update -a || true
+          ./scripts/feeds install -a || true
+
+      - name: Download custom config (if provided)
+        if: inputs.custom_config_url != ''
+        run: |
+          echo "Downloading custom config from: ${{ inputs.custom_config_url }}"
+          curl -fsSL "${{ inputs.custom_config_url }}" -o custom_config_download
+          
+          # 验证下载的文件不为空
+          if [[ ! -s custom_config_download ]]; then
+            echo "Error: Downloaded config is empty"
+            exit 1
+          fi
+          
+          echo "Custom config downloaded ($(wc -l < custom_config_download) lines)"
+
+      - name: Build platforms
+        run: |
+          chmod +x "${GITHUB_WORKSPACE}/scripts/build.sh"
+          
+          # 设置环境变量
+          export PLATFORMS="${{ steps.platforms.outputs.platforms }}"
+          export ARTIFACT="${{ inputs.artifact }}"
+          export OPENWRT_VERSION="${{ inputs.openwrt_version }}"
+          export CUSTOM_CONFIG=""
+          
+          if [[ "${{ inputs.custom_config_url }}" != "" ]]; then
+            export CUSTOM_CONFIG="${GITHUB_WORKSPACE}/custom_config_download"
+          fi
+          
+          # 执行编译
+          "${GITHUB_WORKSPACE}/scripts/build.sh"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Prepare firmware artifacts
+        if: contains(inputs.artifact, 'firmware')
+        run: |
+          mkdir -p firmware-output
+          
+          cd openwrt
+          
+          # 收集固件文件
+          find bin/targets -type f \( \
+            -name "*.bin" -o \
+            -name "*.img" -o \
+            -name "*.img.gz" -o \
+            -name "*.squashfs" \
+          \) 2>/dev/null | while read f; do
+            cp -v "$f" "$GITHUB_WORKSPACE/firmware-output/"
+          done
+          
+          # 生成版本信息
+          {
+            echo "Build Date: $(date)"
+            echo "Platform: ${{ inputs.platform }}"
+            echo "OpenWrt Version: ${{ inputs.openwrt_version }}"
+            echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'N/A')"
+            echo ""
+            echo "Files:"
+            ls -lh "$GITHUB_WORKSPACE/firmware-output/" 2>/dev/null || echo "No files"
+          } > "$GITHUB_WORKSPACE/firmware-output/BUILD_INFO.txt"
+
+      - name: Upload firmware artifact
         if: contains(inputs.artifact, 'firmware')
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-firmware-${{ inputs.platform }}
-          path: |
-            output/firmware/*.bin
-            output/firmware/*.img
+          name: ${{ steps.artifact_names.outputs.firmware }}
+          path: firmware-output/
           retention-days: 14
+          compression-level: 9
 
-      - name: Upload package artifacts
+      - name: Prepare package artifacts
+        if: contains(inputs.artifact, 'packages')
+        run: |
+          mkdir -p packages-output
+          
+          cd openwrt
+          
+          # 收集 ipk 包
+          find bin/packages -type f -name "*.ipk" 2>/dev/null | while read f; do
+            cp -v "$f" "$GITHUB_WORKSPACE/packages-output/"
+          done
+          
+          # 生成包索引
+          if command -v make &>/dev/null; then
+            make package/index V=s || true
+          fi
+          
+          # Packages.gz 索引
+          if [[ -f "bin/packages/Packages.gz" ]]; then
+            cp -v bin/packages/Packages.gz "$GITHUB_WORKSPACE/packages-output/"
+          fi
+
+      - name: Upload packages artifact
         if: contains(inputs.artifact, 'packages')
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-packages-${{ inputs.platform }}
-          path: |
-            output/packages/**/*.ipk
-            output/packages/**/*.deb
+          name: ${{ steps.artifact_names.outputs.packages }}
+          path: packages-output/
           retention-days: 14
+          compression-level: 9
+
+      - name: Build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Configuration | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | \`${{ inputs.platform }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact Type | \`${{ inputs.artifact }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenWrt Version | \`${{ inputs.openwrt_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Toolchain Cache | \`${{ steps.download_toolchain.outputs.found || 'not checked' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ -d "firmware-output" ]]; then
+            echo "### Firmware Files" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            ls -lh firmware-output/ 2>/dev/null || echo "No firmware files" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ -d "packages-output" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Package Files" >> $GITHUB_STEP_SUMMARY
+            PKG_COUNT=$(find packages-output -name "*.ipk" 2>/dev/null | wc -l)
+            echo "Total packages: $PKG_COUNT" >> $GITHUB_STEP_SUMMARY
+          fi
