@@ -344,9 +344,10 @@ build_platform() {
     if [[ -d "$source_dir" && -f "$source_dir/Makefile" ]]; then
         log_step "使用工作流已准备好的源码: ${source_dir}"
         # 从已准备好的源码复制到平台构建目录
-        # 使用硬链接避免重复占用磁盘
+        # 注意: $platform_dir 已由 mkdir -p 创建，必须用 source/. → target/
+        #       否则 cp 会把 source 作为子目录嵌套进去
         log_info "复制源码到平台构建目录..."
-        cp -al "$source_dir" "$platform_dir" 2>/dev/null || cp -r "$source_dir" "$platform_dir"
+        cp -al "$source_dir"/. "$platform_dir"/ 2>/dev/null || cp -r "$source_dir"/. "$platform_dir"/
         log_info "源码准备完成"
     else
         log_step "openwrt/ 不存在，自行克隆源码"
