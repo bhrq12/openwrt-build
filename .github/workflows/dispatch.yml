@@ -3,21 +3,21 @@ name: OpenWrt Dispatch
 on:
   workflow_dispatch:
     inputs:
-      # ========== 平台选择 ==========
+      # ========== 平台选锟斤拷 ==========
       platforms:
         description: "Target platforms (space-separated, e.g. ipq40xx x86_64)"
         required: true
         type: string
         default: "ipq40xx"
 
-      # ========== 源码版本 ==========
+      # ========== 源锟斤拷姹?==========
       openwrt_version:
         description: "OpenWrt source (branch/tag/commit)"
         required: true
         type: string
         default: "master"
 
-      # ========== 产物类型 ==========
+      # ========== 锟斤拷锟斤拷锟斤拷锟斤拷 ==========
       artifact_type:
         description: "Build artifact type"
         required: true
@@ -28,7 +28,7 @@ on:
           - both
         default: "firmware"
 
-      # ========== 高级选项 ==========
+      # ========== 锟竭硷拷选锟斤拷 ==========
       custom_openwrt_repo:
         description: "Custom OpenWrt repo URL (leave empty for default)"
         required: false
@@ -64,7 +64,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ========== 预检查 ==========
+  # ========== 预锟斤拷锟?==========
   precheck:
     runs-on: ubuntu-latest
     outputs:
@@ -127,7 +127,7 @@ jobs:
           echo "**Toolchain**: Automatically determined by comparing tools/toolchain directory commit hash." >> $GITHUB_STEP_SUMMARY
           echo "No manual selection needed - cache is used if hash matches, rebuilt if not." >> $GITHUB_STEP_SUMMARY
 
-  # ========== 触发各平台编译 ==========
+  # ========== 锟斤拷锟斤拷锟斤拷平台锟斤拷锟斤拷 ==========
   build-platforms:
     needs: precheck
     runs-on: ubuntu-latest
@@ -147,7 +147,7 @@ jobs:
               platform: '${{ matrix.platform }}',
               artifact: '${{ inputs.artifact_type }}',
               openwrt_version: '${{ inputs.openwrt_version }}',
-              custom_config_url: '${{ inputs.custom_config_url || '\'\'' }}'
+              custom_config_url: '${{ inputs.custom_config_url }}'
             };
 
             console.log('Triggering build.yml with:', JSON.stringify(inputs, null, 2));
@@ -162,7 +162,7 @@ jobs:
 
             console.log('Workflow triggered successfully');
 
-  # ========== 汇总 ==========
+  # ========== 锟斤拷锟斤拷 ==========
   summary:
     needs: [precheck, build-platforms]
     runs-on: ubuntu-latest
@@ -196,3 +196,4 @@ jobs:
           echo "| OpenWrt Version | \`${{ inputs.openwrt_version }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact Type | \`${{ inputs.artifact_type }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Toolchain | \`AUTO (hash-based)\` |" >> $GITHUB_STEP_SUMMARY
+
