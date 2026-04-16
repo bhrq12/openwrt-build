@@ -319,21 +319,63 @@ build_packages() {
     
     cd "$platform_dir"
     
-    # 1. 先编译 toolchain（如果尚未编译）
+    # 1. 使用预编译 SDK（替代从源码编译 toolchain，省 15-20GB 磁盘空间）
     if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
-        log_step "编译 toolchain (线程: ${BUILD_THREADS})"
-        local tc_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
+        log_step "下载预编译 SDK..."
         
-        if ! make toolchain/install -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
-            log_error "Toolchain 编译失败"
+        local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
+        local subtarget="generic"
+        local sdk_name="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}/${sdk_name}"
+        local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
+        
+        log_info "SDK URL: ${sdk_url}"
+        
+        if ! curl -fsSL -o "/tmp/${sdk_name}" "${sdk_url}" 2>&1 | tee -a "$sdk_log"; then
+            log_error "SDK 下载失败"
             return 1
         fi
         
+        log_step "解压 SDK..."
+        if ! tar xJf "/tmp/${sdk_name}" -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
+            log_error "SDK 解压失败"
+            return 1
+        fi
+        rm -f "/tmp/${sdk_name}"
+        
+        local sdk_dir
+        sdk_dir=$(find "${WORKDIR}/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
+        if [[ -z "$sdk_dir" ]]; then
+            log_error "SDK 解压后未找到目录"
+            return 1
+        fi
+        
+        log_info "SDK 已解压: ${sdk_dir}"
+        
+        # 将 SDK 的 staging_dir 软链接/复制到源码目录
+        if [[ -d "$sdk_dir/staging_dir" ]]; then
+            cp -r "$sdk_dir/staging_dir" ./
+            log_info "SDK staging_dir 已恢复"
+        fi
+        if [[ -d "$sdk_dir/build_dir" ]]; then
+            cp -r "$sdk_dir/build_dir" ./
+            log_info "SDK build_dir 已恢复"
+        fi
+        
+        # 清理 SDK 目录释放空间
+        rm -rf "${sdk_dir}"
+        
         # 标记 toolchain 已就绪
         touch "staging_dir/.toolchain_ready"
-        log_info "Toolchain 编译完成"
+        log_info "SDK 准备完成"
     else
-        log_info "Toolchain 已就绪，跳过编译"
+        log_info "Toolchain 已就绪，跳过"
+    fi
+
+    # 清理 host tools 释放磁盘空间（SDK 的 host 工具已不需要）
+    if [[ -d "staging_dir/host" ]]; then
+        log_info "清理 staging_dir/host 释放磁盘..."
+        rm -rf staging_dir/host
     fi
     
     # 2. 编译 acctl 包
