@@ -279,7 +279,7 @@ build_firmware() {
         log_step "编译 toolchain (线程: ${BUILD_THREADS})"
         local tc_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
         
-        if ! make toolchain -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
+        if ! make toolchain/install -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
             log_error "Toolchain 编译失败"
             return 1
         fi
@@ -323,7 +323,7 @@ build_packages() {
         log_step "编译 toolchain (线程: ${BUILD_THREADS})"
         local tc_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
         
-        if ! make toolchain -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
+        if ! make toolchain/install -j"${BUILD_THREADS}" V=s 2>&1 | tee "$tc_log"; then
             log_error "Toolchain 编译失败"
             return 1
         fi
