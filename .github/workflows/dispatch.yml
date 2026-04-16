@@ -98,7 +98,9 @@ jobs:
           fi
 
           echo "Validated platforms: $VALIDATED"
-          echo "list=$VALIDATED" >> $GITHUB_OUTPUT
+                    # Convert space-separated list to JSON array for matrix
+          JSON_LIST=$(echo "$VALIDATED" | sed 's/ /", "/g')
+          echo "list=[\"$JSON_LIST\"]" >> $GITHUB_OUTPUT
 
       - name: Validate version
         id: validate
