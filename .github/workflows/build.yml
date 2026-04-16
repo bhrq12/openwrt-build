@@ -66,7 +66,7 @@ env:
   OPENWRT_REPO: https://github.com/coolsnowwolf/lede
   ACCTL_REPO: https://github.com/bhrq12/acctl
   ACCTL_BRANCH: main
-  BUILD_THREADS: 4
+  BUILD_THREADS: 0
 
 jobs:
   build:
