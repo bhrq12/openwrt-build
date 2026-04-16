@@ -63,6 +63,10 @@ concurrency:
   group: dispatch-${{ inputs.platforms }}-${{ inputs.openwrt_version }}
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   # ========== 预锟斤拷锟?==========
   precheck:
