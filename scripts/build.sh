@@ -23,7 +23,8 @@ OPENWRT_REPO="${OPENWRT_REPO:-https://github.com/coolsnowwolf/lede}"
 OPENWRT_VERSION="${OPENWRT_VERSION:-${OPENWRT_BRANCH:-master}}"
 ACCTL_REPO="${ACCTL_REPO:-https://github.com/bhrq12/acctl}"
 ACCTL_BRANCH="${ACCTL_BRANCH:-main}"
-BUILD_THREADS="${BUILD_THREADS:-$(nproc)}"
+BUILD_THREADS="${BUILD_THREADS:-0}"
+[[ "$BUILD_THREADS" -eq 0 ]] && BUILD_THREADS=$(nproc)
 
 # 允许被覆盖的环境变量（优先级：环境变量 > 上方默认值）
 if [[ -n "${CUSTOM_OPENWRT_REPO:-}" ]]; then
