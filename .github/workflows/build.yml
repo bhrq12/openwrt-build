@@ -32,7 +32,6 @@ on:
         required: false
         default: master
         type: string
-
       custom_config_url:
         description: "Custom .config raw URL (optional)"
         required: false
@@ -56,7 +55,6 @@ on:
         required: false
         default: master
         type: string
-
       custom_config_url:
         required: false
         type: string
@@ -79,8 +77,225 @@ env:
   ACCTL_BRANCH: main
   BUILD_THREADS: 1
 
+# ============================================================
+# Shared hash logic (used by both toolchain and build jobs)
+# ============================================================
 jobs:
+  # ============================================================
+  # Toolchain Job: 检查缓存 → 命中跳过，未命中则从源码构建并上传 Release
+  # ============================================================
+  toolchain:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480  # 工具链编译可能需要 6-8 小时
+
+    outputs:
+      toolchain_key: ${{ steps.tc_hash.outputs.key }}
+      tc_hash: ${{ steps.tc_hash.outputs.hash }}
+      matched: ${{ steps.check_tc.outputs.matched }}
+
+    steps:
+      - name: Checkout config repo
+        uses: actions/checkout@v4
+
+      # ========== 精准 Hash: 只取 tools/toolchain 目录的 commit ==========
+      - name: Generate toolchain hash (tools/toolchain only)
+        id: tc_hash
+        run: |
+          REPO="$OPENWRT_REPO"
+          VERSION="${{ inputs.openwrt_version }}"
+
+          TEMP_DIR=$(mktemp -d)
+          if ! git clone --depth=1 -b "$VERSION" "$REPO" "$TEMP_DIR/openwrt" 2>/dev/null; then
+            echo "ERROR: Clone failed"
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          TC_HASH=$(cd "$TEMP_DIR/openwrt" && git log --pretty=tformat:"%H" -n1 tools toolchain 2>/dev/null || echo "")
+
+          if [[ -z "$TC_HASH" ]]; then
+            TC_HASH=$(git ls-remote "$REPO" refs/heads/$VERSION 2>/dev/null | head -c 7 || echo "unknown")
+          fi
+
+          rm -rf "$TEMP_DIR"
+
+          CACHE_KEY="toolchain-${{ inputs.platform }}-${TC_HASH}"
+          echo "hash=$TC_HASH" >> $GITHUB_OUTPUT
+          echo "key=$CACHE_KEY" >> $GITHUB_OUTPUT
+          echo "Toolchain hash: $TC_HASH"
+          echo "Cache key: $CACHE_KEY"
+
+      # ========== 检查 Release 中的 hash 是否匹配 ==========
+      - name: Check toolchain hash in Releases
+        id: check_tc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CACHE_KEY="${{ steps.tc_hash.outputs.key }}"
+          TC_HASH="${{ steps.tc_hash.outputs.hash }}"
+
+          echo "Checking toolchain cache for key: $CACHE_KEY"
+
+          if ! gh release view "$CACHE_KEY" &>/dev/null; then
+            echo "Release not found: $CACHE_KEY"
+            echo "matched=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 下载 hash 文件（极小，秒级）
+          HASH_FILE=$(mktemp)
+          if gh release download "$CACHE_KEY" --pattern "*.hash" -O "$HASH_FILE" 2>/dev/null; then
+            REMOTE_HASH=$(cat "$HASH_FILE" | tr -d " \n")
+            echo "Remote hash: $REMOTE_HASH"
+            echo "Local hash:  $TC_HASH"
+
+            if [[ "$REMOTE_HASH" == "$TC_HASH" ]]; then
+              echo "Hash MATCHED - toolchain cache is valid, skipping build"
+              echo "matched=true" >> $GITHUB_OUTPUT
+            else
+              echo "Hash MISMATCH - will rebuild toolchain"
+              echo "matched=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No .hash file in release, cannot verify, rebuilding"
+            echo "matched=false" >> $GITHUB_OUTPUT
+          fi
+
+          rm -f "$HASH_FILE"
+
+      # ========== 构建工具链（仅当 hash 未命中时） ==========
+      - name: Build toolchain from source
+        if: steps.check_tc.outputs.matched != 'true'
+        run: |
+          echo "=== Building toolchain from source (cache miss) ==="
+
+          # 设置构建环境
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev \
+            libssl-dev python3-setuptools rsync swig unzip zstd \
+            zlib1g-dev file make pkg-config coreutils
+
+          SOURCE_DIR="${{ github.workspace }}/openwrt"
+          VERSION="${{ inputs.openwrt_version }}"
+
+          # 克隆源码（带重试）
+          for i in 1 2 3; do
+            echo "Cloning OpenWrt ($i/3)..."
+            if git clone --depth=1 -b "$VERSION" "$OPENWRT_REPO" "$SOURCE_DIR" 2>&1; then
+              echo "Clone successful"
+              break
+            fi
+            rm -rf "$SOURCE_DIR"
+            [[ $i -lt 3 ]] && sleep 10
+          done
+
+          if [[ ! -d "$SOURCE_DIR/.git" ]]; then
+            echo "ERROR: Clone failed"
+            exit 1
+          fi
+
+          # 应用平台配置
+          cd "$SOURCE_DIR"
+          CONFIG_FILE="${{ github.workspace }}/configs/${{ inputs.platform }}.config"
+          if [[ -f "$CONFIG_FILE" ]]; then
+            cp "$CONFIG_FILE" .config
+          else
+            echo "ERROR: No config for platform ${{ inputs.platform }}"
+            exit 1
+          fi
+
+          # 强制启用工具链编译选项
+          cat >> .config << 'EOF'
+CONFIG_TOOLCHAINOPTS=y
+CONFIG_DEVEL=y
+CONFIG_CCACHE=n
+EOF
+
+          make defconfig
+
+          echo "=== Compiling toolchain (threads: $(nproc)) ==="
+          echo "Platform: ${{ inputs.platform }}"
+          echo "Target: $(grep CONFIG_TARGET_ .config | head -1)"
+
+          # 编译工具链：tools + toolchain
+          if ! make tools/ninja -j$(nproc) V=s 2>&1 | tee "${{ github.workspace }}/logs/tools_ninja.log"; then
+            echo "tools/ninja failed, retrying single thread..."
+            make tools/ninja -j1 V=s 2>&1 | tee -a "${{ github.workspace }}/logs/tools_ninja.log"
+          fi
+
+          if ! make toolchain/compile -j$(nproc) V=s 2>&1 | tee "${{ github.workspace }}/logs/toolchain_compile.log"; then
+            echo "toolchain/compile failed, retrying single thread..."
+            make toolchain/compile -j1 V=s 2>&1 | tee -a "${{ github.workspace }}/logs/toolchain_compile.log"
+          fi
+
+          # 清理中间文件节省空间
+          rm -rf .tmp-* dl
+          echo "Toolchain build complete"
+
+      # ========== 打包工具链并上传 Release（仅当 hash 未命中时） ==========
+      - name: Package and upload toolchain
+        if: steps.check_tc.outputs.matched != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CACHE_KEY="${{ steps.tc_hash.outputs.key }}"
+          TC_HASH="${{ steps.tc_hash.outputs.hash }}"
+          ARCHIVE_NAME="${CACHE_KEY}.tar.zst"
+          OUTPUT_DIR="${{ github.workspace }}/toolchain_output"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          cd "${{ github.workspace }}/openwrt"
+
+          echo "Packaging: toolchain/ + build_dir/ + staging_dir/"
+          echo "Archive: $ARCHIVE_NAME"
+
+          tar -I "zstd -19" -cf "$OUTPUT_DIR/$ARCHIVE_NAME" \
+            toolchain/ \
+            build_dir/ \
+            staging_dir/
+
+          echo "$TC_HASH" > "$OUTPUT_DIR/${CACHE_KEY}.hash"
+          sha256sum "$OUTPUT_DIR/$ARCHIVE_NAME" > "$OUTPUT_DIR/${ARCHIVE_NAME}.sha256"
+
+          echo "Package size: $(du -h "$OUTPUT_DIR/$ARCHIVE_NAME" | cut -f1)"
+          echo "Hash: $TC_HASH"
+
+          echo ""
+          echo "=== Uploading to GitHub Release: $CACHE_KEY ==="
+
+          gh release create "$CACHE_KEY" \
+            --title "Toolchain ${{ inputs.platform }} @ ${{ inputs.openwrt_version }}" \
+            --notes "Automated toolchain build.
+
+Platform: ${{ inputs.platform }}
+Source: $OPENWRT_REPO (${{ inputs.openwrt_version }})
+Hash (tools/toolchain): $TC_HASH
+
+Files:
+- ${ARCHIVE_NAME} (toolchain + build_dir + staging_dir)
+- ${ARCHIVE_NAME}.sha256
+- ${CACHE_KEY}.hash
+
+Subsequent builds with the same hash will reuse this cached toolchain." \
+            --prerelease || true
+
+          gh release upload "$CACHE_KEY" \
+            "$OUTPUT_DIR/$ARCHIVE_NAME" \
+            "$OUTPUT_DIR/${ARCHIVE_NAME}.sha256" \
+            "$OUTPUT_DIR/${CACHE_KEY}.hash" \
+            --clobber
+
+          echo ""
+          echo "Release: https://github.com/${{ github.repository }}/releases/tag/$CACHE_KEY"
+
+  # ============================================================
+  # Build Job: 等待 toolchain → 下载工具链 → 编译固件/软件包
+  # ============================================================
   build:
+    needs: toolchain
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -101,17 +316,6 @@ jobs:
             libssl-dev python3-setuptools rsync swig unzip zstd \
             zlib1g-dev file make pkg-config wget curl jq coreutils
 
-      - name: Determine platforms to build
-        id: platforms
-        run: |
-          if [[ "${{ inputs.platform }}" == "all" ]]; then
-            PLATFORMS="ipq40xx x86_64 bcm2711 ramips-mt7621"
-          else
-            PLATFORMS="${{ inputs.platform }}"
-          fi
-          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
-          echo "Platforms to build: $PLATFORMS"
-
       - name: Generate artifact names
         id: artifact_names
         run: |
@@ -130,91 +334,24 @@ jobs:
           echo "firmware=$FIRMWARE" >> $GITHUB_OUTPUT
           echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
 
-      # ========== 精准 Hash: 只取 tools/toolchain 目录的 commit ==========
-      - name: Generate toolchain cache key (tools/toolchain only)
-        id: toolchain_key
-        run: |
-          PLATFORM="${{ inputs.platform }}"
-          REPO="$OPENWRT_REPO"
-          VERSION="${{ inputs.openwrt_version }}"
-
-          # 临时克隆，只取 tools/toolchain 目录的 commit hash
-          TEMP_DIR=$(mktemp -d)
-          git clone --depth=1 -b "$VERSION" "$REPO" "$TEMP_DIR/openwrt" 2>/dev/null || true
-
-          # 只取 tools 和 toolchain 目录的 commit（package 变化不影响工具链）
-          TC_HASH=$(cd "$TEMP_DIR/openwrt" && git log --pretty=tformat:"%H" -n1 tools toolchain 2>/dev/null || echo "")
-          rm -rf "$TEMP_DIR"
-
-          # 回退：取分支名的 7 位缩写
-          if [[ -z "$TC_HASH" ]]; then
-            TC_HASH=$(git ls-remote "$REPO" refs/heads/$VERSION 2>/dev/null | head -c 7 || echo "unknown")
-          fi
-
-          CACHE_KEY="toolchain-${PLATFORM}-${TC_HASH}"
-          echo "key=$CACHE_KEY" >> $GITHUB_OUTPUT
-          echo "tc_hash=$TC_HASH" >> $GITHUB_OUTPUT
-          echo "Toolchain cache key: $CACHE_KEY (hash: $TC_HASH)"
-
-      # ========== Hash 文件比对: 先下 hash，小开销判断是否命中 ==========
-      - name: Check toolchain hash in Releases
-        id: check_toolchain_hash
+      # ========== 下载工具链（从 toolchain job 的 Release） ==========
+      - name: Download toolchain from Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          CACHE_KEY="${{ steps.toolchain_key.outputs.key }}"
-          TC_HASH="${{ steps.toolchain_key.outputs.tc_hash }}"
-
-          echo "Checking toolchain cache for key: $CACHE_KEY"
-
-          if ! gh release view "$CACHE_KEY" &>/dev/null; then
-            echo "Release not found: $CACHE_KEY"
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "matched=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # 下载 hash 文件（极小，秒级）
-          HASH_FILE=$(mktemp)
-          if gh release download "$CACHE_KEY" --pattern "*.hash" -O "$HASH_FILE" 2>/dev/null; then
-            REMOTE_HASH=$(cat "$HASH_FILE" | tr -d " \n")
-            echo "Remote hash: $REMOTE_HASH"
-            echo "Local hash:  $TC_HASH"
-
-            if [[ "$REMOTE_HASH" == "$TC_HASH" ]]; then
-              echo "Hash MATCHED - toolchain is valid"
-              echo "found=true" >> $GITHUB_OUTPUT
-              echo "matched=true" >> $GITHUB_OUTPUT
-            else
-              echo "Hash MISMATCH - need to rebuild toolchain"
-              echo "found=false" >> $GITHUB_OUTPUT
-              echo "matched=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "No hash file in release, cannot verify, skipping cache"
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "matched=false" >> $GITHUB_OUTPUT
-          fi
-
-          rm -f "$HASH_FILE"
-
-      # ========== 下载命中的工具链包 ==========
-      - name: Download toolchain archive (hash matched)
-        id: download_toolchain
-        if: steps.check_toolchain_hash.outputs.matched == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CACHE_KEY="${{ steps.toolchain_key.outputs.key }}"
+          CACHE_KEY="${{ needs.toolchain.outputs.toolchain_key }}"
           TC_DIR="${{ github.workspace }}/toolchain_cache"
 
+          echo "Downloading toolchain: $CACHE_KEY"
           mkdir -p "$TC_DIR"
-          echo "Downloading toolchain archive..."
 
-          gh release download "$CACHE_KEY" \
+          if ! gh release download "$CACHE_KEY" \
             --pattern "*.tar.zst" \
             --dir "$TC_DIR" \
-            --clobber
+            --clobber 2>&1; then
+            echo "ERROR: Failed to download toolchain"
+            exit 1
+          fi
 
           ARCHIVE=$(ls "$TC_DIR"/*.tar.zst 2>/dev/null | head -1)
           if [[ -z "$ARCHIVE" ]]; then
@@ -226,8 +363,7 @@ jobs:
           tar -I "zstd -d" -xf "$ARCHIVE" -C "$TC_DIR"
 
           if [[ -d "$TC_DIR/staging_dir" ]]; then
-            echo "Toolchain extracted: $TC_DIR/staging_dir ($(du -sh $TC_DIR/staging_dir | cut -f1))"
-            echo "dir=$TC_DIR" >> $GITHUB_OUTPUT
+            echo "Toolchain ready: staging_dir ($(du -sh $TC_DIR/staging_dir | cut -f1))"
           else
             echo "ERROR: staging_dir not found after extraction"
             ls -la "$TC_DIR"
@@ -235,7 +371,7 @@ jobs:
           fi
 
       # ========== 克隆 OpenWrt 源码（带重试） ==========
-      - name: Clone OpenWrt source (with retry)
+      - name: Clone OpenWrt source
         id: clone_source
         run: |
           SOURCE_DIR="${{ github.workspace }}/openwrt"
@@ -243,26 +379,16 @@ jobs:
           RETRY=3
           INTERVAL=10
 
-          if [[ -d "$SOURCE_DIR/.git" ]]; then
-            echo "Source already exists, skipping clone"
-            echo "cloned=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
           for i in $(seq 1 $RETRY); do
             echo "Cloning OpenWrt ($i/$RETRY): $VERSION"
             if git clone --depth=1 -b "$VERSION" "$OPENWRT_REPO" "$SOURCE_DIR" 2>&1; then
               echo "Clone successful"
               echo "cloned=true" >> $GITHUB_OUTPUT
               exit 0
-            else
-              echo "Clone failed, attempt $i/$RETRY"
-              rm -rf "$SOURCE_DIR"
-              if [[ $i -lt $RETRY ]]; then
-                echo "Waiting ${INTERVAL}s before retry..."
-                sleep $INTERVAL
-              fi
             fi
+            echo "Clone failed, attempt $i/$RETRY"
+            rm -rf "$SOURCE_DIR"
+            [[ $i -lt $RETRY ]] && sleep $INTERVAL
           done
 
           echo "ERROR: Clone failed after $RETRY attempts"
@@ -271,14 +397,13 @@ jobs:
 
       # ========== 注入工具链到源码目录 ==========
       - name: Inject toolchain
-        if: steps.check_toolchain_hash.outputs.matched == 'true'
         run: |
           SOURCE_DIR="${{ github.workspace }}/openwrt"
-          TC_DIR="${{ steps.download_toolchain.outputs.dir }}"
+          TC_DIR="${{ github.workspace }}/toolchain_cache"
 
           echo "Injecting toolchain from: $TC_DIR"
 
-          # 备份已有的 staging_dir
+          # 备份已有的 staging_dir（如果有）
           if [[ -d "$SOURCE_DIR/staging_dir" ]]; then
             mv "$SOURCE_DIR/staging_dir" "$SOURCE_DIR/staging_dir.fresh_build"
           fi
@@ -287,6 +412,9 @@ jobs:
           [[ -d "$TC_DIR/toolchain" ]] && cp -r "$TC_DIR/toolchain" "$SOURCE_DIR/toolchain" && echo "Injected: toolchain/"
           [[ -d "$TC_DIR/build_dir" ]] && cp -r "$TC_DIR/build_dir" "$SOURCE_DIR/build_dir" && echo "Injected: build_dir/"
           [[ -d "$TC_DIR/staging_dir" ]] && cp -r "$TC_DIR/staging_dir" "$SOURCE_DIR/staging_dir" && echo "Injected: staging_dir/"
+
+          # 创建就绪标记
+          touch "$SOURCE_DIR/staging_dir/.toolchain_ready"
 
           echo "Toolchain injection complete"
 
@@ -327,6 +455,18 @@ jobs:
           fi
           echo "Config downloaded ($(wc -l < custom_config_download) lines)"
 
+      # ========== 确定编译平台 ==========
+      - name: Determine platforms to build
+        id: platforms
+        run: |
+          if [[ "${{ inputs.platform }}" == "all" ]]; then
+            PLATFORMS="ipq40xx x86_64 bcm2711 ramips-mt7621"
+          else
+            PLATFORMS="${{ inputs.platform }}"
+          fi
+          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
+          echo "Platforms to build: $PLATFORMS"
+
       # ========== 执行编译脚本 ==========
       - name: Build platforms
         run: |
@@ -338,16 +478,10 @@ jobs:
           export OPENWRT_REPO
           export ACCTL_REPO
           export ACCTL_BRANCH
+          export TOOLCHAIN_DIR="${{ github.workspace }}/toolchain_cache"
 
-          # 仅在 hash 命中时设置工具链目录
-          if [[ "${{ steps.check_toolchain_hash.outputs.matched }}" == "true" ]]; then
-            export TOOLCHAIN_DIR="${{ steps.download_toolchain.outputs.dir }}"
-            echo "Using cached toolchain: $TOOLCHAIN_DIR"
-          else
-            echo "No valid toolchain cache, building from source"
-          fi
+          echo "Using cached toolchain: $TOOLCHAIN_DIR"
 
-          # 自定义配置
           if [[ "${{ inputs.custom_config_url }}" != "" ]]; then
             export CUSTOM_CONFIG="${{ github.workspace }}/custom_config_download"
           fi
@@ -376,8 +510,9 @@ jobs:
             echo "Build Date: $(date)"
             echo "Platform: ${{ inputs.platform }}"
             echo "OpenWrt Version: ${{ inputs.openwrt_version }}"
-            echo "Toolchain Hash: ${{ steps.toolchain_key.outputs.tc_hash }}"
-            echo "Toolchain Cache Used: ${{ steps.check_toolchain_hash.outputs.matched }}"
+            echo "Toolchain Key: ${{ needs.toolchain.outputs.toolchain_key }}"
+            echo "Toolchain Hash: ${{ needs.toolchain.outputs.tc_hash }}"
+            echo "Toolchain Cache: ${{ needs.toolchain.outputs.matched }}"
             echo ""
             echo "Files:"
             ls -lh "${{ github.workspace }}/firmware-output/" 2>/dev/null || echo "No files"
@@ -430,9 +565,9 @@ jobs:
           echo "| Platform | \`${{ inputs.platform }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Artifact | \`${{ inputs.artifact }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| OpenWrt | \`${{ inputs.openwrt_version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Toolchain Key | \`${{ steps.toolchain_key.outputs.key }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Toolchain Hash | \`${{ steps.toolchain_key.outputs.tc_hash }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Toolchain Cache | \`${{ steps.check_toolchain_hash.outputs.matched }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Toolchain Key | \`${{ needs.toolchain.outputs.toolchain_key }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Toolchain Hash | \`${{ needs.toolchain.outputs.tc_hash }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Toolchain Cache | \`${{ needs.toolchain.outputs.matched }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Source Cloned | \`${{ steps.clone_source.outputs.cloned }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
