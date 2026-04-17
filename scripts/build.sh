@@ -465,6 +465,10 @@ build_packages() {
             done
             
             # 生成包索引
+            # Ensure usign is available for package index signing
+            if [[ ! -x "staging_dir/host/bin/usign" ]]; then
+                make tools/usign/compile V=s 2>/dev/null || true
+            fi
             make package/index V=s || true
         else
             log_warn "acctl 编译失败"
@@ -614,9 +618,9 @@ main() {
         PLATFORM="$platform"
         
         if build_platform "$platform"; then
-            ((success_count++))
+            success_count=$((success_count + 1))
         else
-            ((fail_count++))
+            fail_count=$((fail_count + 1))
             failed_platforms="${failed_platforms} ${platform}"
         fi
     done
