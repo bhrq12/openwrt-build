@@ -452,6 +452,9 @@ build_packages() {
     local log_file="${WORKDIR}/logs/build-${PLATFORM}-packages.log"
     
     if [[ -d "package/acctl" ]]; then
+        # Clean any stale build stamps to force recompile
+        make package/acctl/clean V=s 2>/dev/null || true
+
         if make package/acctl/compile V=s -j"${BUILD_THREADS}" 2>&1 | tee "$log_file"; then
             log_info "acctl 编译成功"
             
