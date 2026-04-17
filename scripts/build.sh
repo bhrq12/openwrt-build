@@ -430,7 +430,23 @@ build_packages() {
         rm -rf staging_dir/host
     fi
 
-    # 2. 编译 acctl 包
+    # 2. 编译 toolchain（如果需要从源码编译）
+    if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
+        log_step "编译工具链 (线程: ${BUILD_THREADS})"
+        local toolchain_log="${WORKDIR}/logs/build-${PLATFORM}-toolchain.log"
+        if ! make tools/ninja V=s -j"${BUILD_THREADS}" 2>&1 | tee -a "$toolchain_log"; then
+            log_error "tools/ninja 编译失败"
+            return 1
+        fi
+        if ! make toolchain/compile V=s -j"${BUILD_THREADS}" 2>&1 | tee -a "$toolchain_log"; then
+            log_error "toolchain 编译失败"
+            return 1
+        fi
+        touch "staging_dir/.toolchain_ready"
+        log_info "Toolchain 编译完成"
+    fi
+
+    # 3. 编译 acctl 包
     log_step "编译软件包 (线程: ${BUILD_THREADS})"
     
     local log_file="${WORKDIR}/logs/build-${PLATFORM}-packages.log"
