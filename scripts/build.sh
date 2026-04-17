@@ -323,9 +323,15 @@ build_packages() {
     if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
         log_step "下载预编译 SDK..."
         
-        local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
         local subtarget="generic"
-        local sdk_name="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        # master 分支对应 snapshots，releases 目录仅用于正式发布版本
+        if [[ "${OPENWRT_VERSION}" == "master" ]]; then
+            local sdk_base="https://downloads.openwrt.org/snapshots/targets"
+            local sdk_name="openwrt-sdk-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        else
+            local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
+            local sdk_name="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        fi
         local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}/${sdk_name}"
         local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
         
