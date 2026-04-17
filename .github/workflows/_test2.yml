@@ -1,0 +1,19 @@
+name: Test Combined
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        type: string
+        required: false
+        default: "test"
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "Hello ${{ inputs.platform }}"
