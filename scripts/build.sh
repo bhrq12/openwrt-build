@@ -319,118 +319,117 @@ build_packages() {
     
     cd "$platform_dir"
     
-    # 1. 使用预编译 SDK（替代从源码编译 toolchain，省 15-20GB 磁盘空间）
+    # 1. 检查是否需要编译 toolchain
     if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
-        log_step "下载预编译 SDK..."
-        
+        log_step "准备编译环境..."
+
         local subtarget="generic"
         # master 分支对应 snapshots，releases 目录仅用于正式发布版本
-    if [[ "${OPENWRT_VERSION}" == "master" ]]; then
-        local sdk_base="https://downloads.openwrt.org/snapshots/targets"
-    else
-        local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
-    fi
-    local subtarget="generic"
-    local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}"
-    local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
-    local sdk_name=""
-
-    # Probe zstd format first (new versions like 25.12.x with gcc-14.3.0)
-    local candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst"
-    if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
-        sdk_name="${candidate}"
-        log_info "Found zstd SDK: ${sdk_name}"
-    elif [[ "${OPENWRT_VERSION}" == "master" ]]; then
-        # snapshots without gcc version in name
-        candidate="openwrt-sdk-${PLATFORM}-${subtarget}_x86_64.tar.xz"
-        if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
-            sdk_name="${candidate}"
-            log_info "Found xz SDK (snapshots): ${sdk_name}"
+        if [[ "${OPENWRT_VERSION}" == "master" ]]; then
+            local sdk_base="https://downloads.openwrt.org/snapshots/targets"
+        else
+            local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
         fi
-    else
-        # releases in old x86_64.tar.xz format
-        candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
-        if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
-            sdk_name="${candidate}"
-            log_info "Found xz SDK (releases): ${sdk_name}"
-        fi
-    fi
-
-    if [[ -z "${sdk_name}" ]]; then
-        log_error "SDK not found for version: ${OPENWRT_VERSION}"
-        return 1
-    fi
-
-    log_info "Downloading SDK: ${sdk_url}/${sdk_name}"
-    if ! curl -fsSL -o "/tmp/${sdk_name}" "${sdk_url}/${sdk_name}" 2>&1 | tee -a "$sdk_log"; then
-        log_error "SDK download failed"
-        return 1
-    fi
-
-    log_step "Extracting SDK..."
-    if [[ "${sdk_name}" == *.zst ]]; then
-        if ! zstd -dc "/tmp/${sdk_name}" | tar xf - -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
-            log_error "SDK extract failed (zstd)"
-            return 1
-        fi
-    else
-        if ! tar xJf "/tmp/${sdk_name}" -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
-            log_error "SDK extract failed"
-            return 1
-        fi
-    fi
-    rm -f "/tmp/${sdk_name}"
+        local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}"
         local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
-        
-        log_info "SDK URL: ${sdk_url}"
-        
-        if ! curl -fsSL -o "/tmp/${sdk_name}" "${sdk_url}" 2>&1 | tee -a "$sdk_log"; then
-            log_error "SDK 下载失败"
-            return 1
+        local sdk_name=""
+
+        # 尝试查找可用的 SDK
+        # Probe zstd format first (new versions like 25.12.x with gcc-14.3.0)
+        local candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst"
+        if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+            sdk_name="${candidate}"
+            log_info "Found zstd SDK: ${sdk_name}"
+        elif [[ "${OPENWRT_VERSION}" == "master" ]]; then
+            # snapshots without gcc version in name
+            candidate="openwrt-sdk-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+            if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+                sdk_name="${candidate}"
+                log_info "Found xz SDK (snapshots): ${sdk_name}"
+            fi
+        else
+            # releases in old x86_64.tar.xz format
+            candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+            if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+                sdk_name="${candidate}"
+                log_info "Found xz SDK (releases): ${sdk_name}"
+            fi
         fi
-        
-        log_step "解压 SDK..."
-        if ! tar xJf "/tmp/${sdk_name}" -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
-            log_error "SDK 解压失败"
-            return 1
+
+        if [[ -z "${sdk_name}" ]]; then
+            log_warn "SDK not found for version: ${OPENWRT_VERSION}, 将从源码编译 toolchain"
+            # 跳过 SDK，继续从源码编译
+        else
+            # 下载并解压 SDK
+            log_info "Downloading SDK: ${sdk_url}/${sdk_name}"
+            if ! curl -fsSL -o "/tmp/${sdk_name}" "${sdk_url}/${sdk_name}" 2>&1 | tee -a "$sdk_log"; then
+                log_warn "SDK download failed, 将从源码编译 toolchain"
+            else
+                log_step "Extracting SDK..."
+                if [[ "${sdk_name}" == *.zst ]]; then
+                    if ! zstd -dc "/tmp/${sdk_name}" | tar xf - -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
+                        log_warn "SDK extract failed (zstd), 将从源码编译 toolchain"
+                        rm -f "/tmp/${sdk_name}"
+                    else
+                        rm -f "/tmp/${sdk_name}"
+                        local sdk_dir
+                        sdk_dir=$(find "${WORKDIR}/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
+                        if [[ -z "$sdk_dir" ]]; then
+                            log_warn "SDK directory not found, 将从源码编译 toolchain"
+                        else
+                            log_info "SDK extracted: ${sdk_dir}"
+                            # Copy staging_dir and build_dir
+                            if [[ -d "$sdk_dir/staging_dir" ]]; then
+                                cp -r "$sdk_dir/staging_dir" ./
+                                log_info "SDK staging_dir restored"
+                            fi
+                            if [[ -d "$sdk_dir/build_dir" ]]; then
+                                cp -r "$sdk_dir/build_dir" ./
+                                log_info "SDK build_dir restored"
+                            fi
+                            rm -rf "${sdk_dir}"
+                            touch "staging_dir/.toolchain_ready"
+                            log_info "SDK ready"
+                        fi
+                    fi
+                else
+                    if ! tar xJf "/tmp/${sdk_name}" -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
+                        log_warn "SDK extract failed, 将从源码编译 toolchain"
+                        rm -f "/tmp/${sdk_name}"
+                    else
+                        rm -f "/tmp/${sdk_name}"
+                        local sdk_dir
+                        sdk_dir=$(find "${WORKDIR}/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
+                        if [[ -z "$sdk_dir" ]]; then
+                            log_warn "SDK directory not found, 将从源码编译 toolchain"
+                        else
+                            log_info "SDK extracted: ${sdk_dir}"
+                            if [[ -d "$sdk_dir/staging_dir" ]]; then
+                                cp -r "$sdk_dir/staging_dir" ./
+                                log_info "SDK staging_dir restored"
+                            fi
+                            if [[ -d "$sdk_dir/build_dir" ]]; then
+                                cp -r "$sdk_dir/build_dir" ./
+                                log_info "SDK build_dir restored"
+                            fi
+                            rm -rf "${sdk_dir}"
+                            touch "staging_dir/.toolchain_ready"
+                            log_info "SDK ready"
+                        fi
+                    fi
+                fi
+            fi
         fi
-        rm -f "/tmp/${sdk_name}"
-        
-        local sdk_dir
-        sdk_dir=$(find "${WORKDIR}/sdk" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
-        if [[ -z "$sdk_dir" ]]; then
-            log_error "SDK 解压后未找到目录"
-            return 1
-        fi
-        
-        log_info "SDK 已解压: ${sdk_dir}"
-        
-        # 将 SDK 的 staging_dir 软链接/复制到源码目录
-        if [[ -d "$sdk_dir/staging_dir" ]]; then
-            cp -r "$sdk_dir/staging_dir" ./
-            log_info "SDK staging_dir 已恢复"
-        fi
-        if [[ -d "$sdk_dir/build_dir" ]]; then
-            cp -r "$sdk_dir/build_dir" ./
-            log_info "SDK build_dir 已恢复"
-        fi
-        
-        # 清理 SDK 目录释放空间
-        rm -rf "${sdk_dir}"
-        
-        # 标记 toolchain 已就绪
-        touch "staging_dir/.toolchain_ready"
-        log_info "SDK 准备完成"
     else
-        log_info "Toolchain 已就绪，跳过"
+        log_info "Toolchain ready, skipping"
     fi
 
-    # 清理 host tools 释放磁盘空间（SDK 的 host 工具已不需要）
+    # 清理 host tools 释放磁盘空间
     if [[ -d "staging_dir/host" ]]; then
-        log_info "清理 staging_dir/host 释放磁盘..."
+        log_info "Cleaning staging_dir/host..."
         rm -rf staging_dir/host
     fi
-    
+
     # 2. 编译 acctl 包
     log_step "编译软件包 (线程: ${BUILD_THREADS})"
     
