@@ -1,4 +1,4 @@
-name: OpenWrt Build
+﻿name: OpenWrt Build
 
 on:
   workflow_dispatch:
@@ -269,20 +269,7 @@ EOF
           gh release create "$CACHE_KEY" \
             --title "Toolchain ${{ inputs.platform }} @ ${{ inputs.openwrt_version }}" \
             --notes "Automated toolchain build.
-
-Platform: ${{ inputs.platform }}
-Source: $OPENWRT_REPO (${{ inputs.openwrt_version }})
-Hash (tools/toolchain): $TC_HASH
-
-Files:
-- ${ARCHIVE_NAME} (toolchain + build_dir + staging_dir)
-- ${ARCHIVE_NAME}.sha256
-- ${CACHE_KEY}.hash
-
-Subsequent builds with the same hash will reuse this cached toolchain." \
-            --prerelease || true
-
-          gh release upload "$CACHE_KEY" \
+            Automated toolchain build. Platform, source and hash in release. Subsequent builds reuse this toolchain." \
             "$OUTPUT_DIR/$ARCHIVE_NAME" \
             "$OUTPUT_DIR/${ARCHIVE_NAME}.sha256" \
             "$OUTPUT_DIR/${CACHE_KEY}.hash" \
