@@ -325,14 +325,61 @@ build_packages() {
         
         local subtarget="generic"
         # master 分支对应 snapshots，releases 目录仅用于正式发布版本
-        if [[ "${OPENWRT_VERSION}" == "master" ]]; then
-            local sdk_base="https://downloads.openwrt.org/snapshots/targets"
-            local sdk_name="openwrt-sdk-${PLATFORM}-${subtarget}_x86_64.tar.xz"
-        else
-            local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
-            local sdk_name="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+    if [[ "${OPENWRT_VERSION}" == "master" ]]; then
+        local sdk_base="https://downloads.openwrt.org/snapshots/targets"
+    else
+        local sdk_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets"
+    fi
+    local subtarget="generic"
+    local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}"
+    local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
+    local sdk_name=""
+
+    # Probe zstd format first (new versions like 25.12.x with gcc-14.3.0)
+    local candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_gcc-14.3.0_musl_eabi.Linux-x86_64.tar.zst"
+    if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+        sdk_name="${candidate}"
+        log_info "Found zstd SDK: ${sdk_name}"
+    elif [[ "${OPENWRT_VERSION}" == "master" ]]; then
+        # snapshots without gcc version in name
+        candidate="openwrt-sdk-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+            sdk_name="${candidate}"
+            log_info "Found xz SDK (snapshots): ${sdk_name}"
         fi
-        local sdk_url="${sdk_base}/${PLATFORM}/${subtarget}/${sdk_name}"
+    else
+        # releases in old x86_64.tar.xz format
+        candidate="openwrt-sdk-${OPENWRT_VERSION}-${PLATFORM}-${subtarget}_x86_64.tar.xz"
+        if curl -fsIL "${sdk_url}/${candidate}" -o /dev/null 2>&1; then
+            sdk_name="${candidate}"
+            log_info "Found xz SDK (releases): ${sdk_name}"
+        fi
+    fi
+
+    if [[ -z "${sdk_name}" ]]; then
+        log_error "SDK not found for version: ${OPENWRT_VERSION}"
+        return 1
+    fi
+
+    log_info "Downloading SDK: ${sdk_url}/${sdk_name}"
+    if ! curl -fsSL -o "/tmp/${sdk_name}" "${sdk_url}/${sdk_name}" 2>&1 | tee -a "$sdk_log"; then
+        log_error "SDK download failed"
+        return 1
+    fi
+
+    log_step "Extracting SDK..."
+    if [[ "${sdk_name}" == *.zst ]]; then
+        if ! zstd -dc "/tmp/${sdk_name}" | tar xf - -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
+            log_error "SDK extract failed (zstd)"
+            return 1
+        fi
+    else
+        if ! tar xJf "/tmp/${sdk_name}" -C "${WORKDIR}/sdk/" 2>&1 | tee -a "$sdk_log"; then
+            log_error "SDK extract failed"
+            return 1
+        fi
+    fi
+    rm -f "/tmp/${sdk_name}"
         local sdk_log="${WORKDIR}/logs/build-${PLATFORM}-sdk.log"
         
         log_info "SDK URL: ${sdk_url}"
