@@ -261,7 +261,8 @@ inject_toolchain() {
     fi
     
     if [[ $restored -eq 1 ]]; then
-        log_info "工具链已恢复"
+        touch staging_dir/.toolchain_ready
+        log_info "工具链已恢复（缓存注入）"
     else
         log_warn "工具链缓存目录为空，将从源码编译"
         return 1
