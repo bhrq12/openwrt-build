@@ -446,37 +446,68 @@ build_packages() {
         log_info "Toolchain 编译完成"
     fi
 
-    # 3. 编译 acctl 包
-    log_step "编译软件包 (线程: ${BUILD_THREADS})"
+    # 3. 编译 acctl 包（仅编译 acctl + 依赖，不编译全量包）
+    log_step "编译 acctl 软件包 (线程: ${BUILD_THREADS})"
     
     local log_file="${WORKDIR}/logs/build-${PLATFORM}-packages.log"
     
     if [[ -d "package/acctl" ]]; then
-        # Clean any stale build stamps to force recompile
+        # 清除旧编译缓存，强制重新编译
         make package/acctl/clean V=s 2>/dev/null || true
 
-        if make package/acctl/compile V=s -j"${BUILD_THREADS}" 2>&1 | tee "$log_file"; then
-            log_info "acctl 编译成功"
-            
-            # 收集产物
-            find bin/packages -type f -name "*.ipk" 2>/dev/null | while read -r f; do
-                if [[ -f "$f" ]]; then
-                    local fname="$(basename "$f")"
-                    mkdir -p "${output_packages}"
-                    cp -v "$f" "${output_packages}/${fname}"
-                fi
-            done
-            
-            # 生成包索引
-            # Ensure usign is available for package index signing
-            if [[ ! -x "staging_dir/host/bin/usign" ]]; then
-                make tools/usign/compile V=s 2>/dev/null || true
-            fi
-            make package/index V=s || true
-        else
-            log_warn "acctl 编译失败"
+        # 编译 acctl（自动编译其依赖）
+        log_info "正在编译 acctl..."
+        if ! make package/acctl/compile V=s -j"${BUILD_THREADS}" 2>&1 | tee "$log_file"; then
+            log_error "acctl 编译失败"
             return 1
         fi
+
+        # 安装 acctl 到 staging_dir + 生成 ipk
+        log_info "正在安装 acctl 并生成 ipk..."
+        if ! make package/acctl/install V=s -j"${BUILD_THREADS}" 2>&1 | tee -a "$log_file"; then
+            log_warn "acctl install 失败，尝试继续"
+        fi
+
+        # 编译依赖包的 ipk（acctl 需要的运行时依赖）
+        log_info "正在编译依赖包 ipk..."
+        local dep_packages="libuci uci libubus ubus ubusd libubox lua libjson-c libiwinfo libubus-lua libpthread libnl-tiny jshn"
+        for pkg in $dep_packages; do
+            make package/${pkg}/compile V=s -j"${BUILD_THREADS}" 2>/dev/null || true
+            make package/${pkg}/install V=s -j"${BUILD_THREADS}" 2>/dev/null || true
+        done
+
+        # 确保 usign 可用
+        if [[ ! -x "staging_dir/host/bin/usign" ]]; then
+            log_info "编译 usign..."
+            make tools/usign/compile V=s 2>/dev/null || true
+        fi
+
+        # 生成包索引
+        make package/index V=s 2>/dev/null || true
+
+        log_info "acctl 编译成功"
+
+        # 收集 acctl ipk
+        mkdir -p "${output_packages}"
+        local acctl_found=0
+        find bin/packages -type f -name "acctl_*.ipk" 2>/dev/null | while read -r f; do
+            cp -v "$f" "${output_packages}/"
+        done
+
+        # 检查是否找到 acctl ipk
+        if find "${output_packages}" -name "acctl_*.ipk" -print -quit 2>/dev/null | grep -q .; then
+            log_info "acctl ipk 已生成"
+        else
+            log_warn "未找到 acctl ipk，检查 bin/packages 目录内容:"
+            find bin/packages -name "*.ipk" -type f 2>/dev/null | head -20 | while read -r f; do
+                log_info "  $(basename "$f")"
+            done
+        fi
+
+        # 也收集依赖的 ipk（供手动安装用）
+        find bin/packages -type f -name "*.ipk" 2>/dev/null | while read -r f; do
+            cp -v "$f" "${output_packages}/" 2>/dev/null || true
+        done
     else
         log_warn "acctl 不存在，跳过包编译"
     fi
