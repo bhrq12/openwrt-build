@@ -549,6 +549,15 @@ build_platform() {
         inject_toolchain "$source_dir"
     fi
     
+
+    # 2.5 标记工具链就绪（工作流注入或 restore 后都需要标记）
+    if [[ ! -f "$source_dir/staging_dir/.toolchain_ready" ]]; then
+        if [[ -f "$source_dir/staging_dir/host/bin/cc" ]] || [[ -d "$source_dir/toolchain" ]]; then
+            touch "$source_dir/staging_dir/.toolchain_ready"
+            log_info "工具链已就绪（缓存命中）"
+        fi
+    fi
+
     # 3. 应用配置
     apply_config "$platform" || return 1
     
