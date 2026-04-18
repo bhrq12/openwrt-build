@@ -27,6 +27,11 @@ on:
         required: false
         default: master
         type: string
+      source_ref:
+        description: "Git branch/tag for source code (default: master)"
+        required: false
+        default: master
+        type: string
       custom_config_url:
         description: "Custom .config raw URL (optional)"
         required: false
