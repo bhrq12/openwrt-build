@@ -1,4 +1,4 @@
-name: Openwrt Toolchain Cache Build
+name: Openwrt Toolchain Build
 
 on:
   workflow_dispatch:
