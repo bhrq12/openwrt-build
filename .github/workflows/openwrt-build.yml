@@ -46,6 +46,10 @@ on:
         required: false
         type: string
         default: master
+      source_ref:
+        required: false
+        type: string
+        default: master
       custom_config_url:
         required: false
         type: string
