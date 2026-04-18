@@ -359,7 +359,7 @@ build_packages() {
 
         if [[ -z "${sdk_name}" ]]; then
             log_warn "SDK not found for version: ${OPENWRT_VERSION}, 将从源码编译 toolchain"
-            # 跳过 SDK，继续从源码编译
+            # lede 没有官方 SDK，直接从源码编译工具链
         else
             # 下载并解压 SDK
             log_info "Downloading SDK: ${sdk_url}/${sdk_name}"
@@ -425,11 +425,7 @@ build_packages() {
         log_info "Toolchain ready, skipping"
     fi
 
-    # 清理 host tools 释放磁盘空间
-    if [[ -d "staging_dir/host" ]]; then
-        log_info "Cleaning staging_dir/host..."
-        rm -rf staging_dir/host
-    fi
+    # 注意: 不要删除 staging_dir/host，后续 make package/index 等需要 usign 等工具
 
     # 2. 编译 toolchain（如果需要从源码编译）
     if [[ ! -f "staging_dir/.toolchain_ready" ]]; then
@@ -550,9 +546,12 @@ build_platform() {
     fi
     
 
-    # 2.5 标记工具链就绪（工作流注入或 restore 后都需要标记）
+    # 2.5 标记工具链就绪（仅在工作流已注入编译好的工具链时标记）
+    # 注意: 不能用 -d toolchain/ 检测，lede 源码自带 toolchain/ 目录（编译配方，非产物）
     if [[ ! -f "$source_dir/staging_dir/.toolchain_ready" ]]; then
-        if [[ -f "$source_dir/staging_dir/host/bin/cc" ]] || [[ -d "$source_dir/toolchain" ]]; then
+        # 检测真正的编译产物：staging_dir 下的交叉编译工具链目录
+        if [[ -n "$(ls -d "$source_dir/staging_dir"/toolchain-*/bin 2>/dev/null)" ]] && \
+           [[ -f "$source_dir/staging_dir/host/bin/cc" ]]; then
             touch "$source_dir/staging_dir/.toolchain_ready"
             log_info "工具链已就绪（缓存命中）"
         fi
